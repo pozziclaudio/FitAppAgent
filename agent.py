@@ -1,22 +1,21 @@
 """
 FitTrack Voice Agent — LiveKit STT-only agent.
 
-Joins a LiveKit room, subscribes to the user's audio track,
-runs Deepgram streaming STT, and sends transcriptions back
-to the client via data channel as JSON messages.
+Uses AgentSession with Deepgram STT. Transcriptions are sent
+back to the client via data channel as JSON messages.
 """
 
 import json
 import logging
-import asyncio
-import traceback
 
-from livekit import rtc
 from livekit.agents import (
+    Agent,
+    AgentSession,
     AutoSubscribe,
     JobContext,
     WorkerOptions,
     cli,
+    get_job_context,
 )
 from livekit.agents.stt import SpeechEvent, SpeechEventType
 from livekit.plugins import deepgram
@@ -25,109 +24,71 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fittrack-agent")
 
 
+class TranscriptionAgent(Agent):
+    """Minimal agent that just relays STT transcriptions via data channel."""
+
+    def __init__(self):
+        super().__init__(instructions="You are a transcription relay. Do not speak.")
+
+    async def on_user_speech_committed(self, message):
+        """Called when STT produces a final transcript."""
+        text = message.get("text", "") if isinstance(message, dict) else str(message)
+        if text:
+            logger.info(f"FINAL: {text}")
+            await self._send_transcript(text, is_final=True)
+        # Return empty string to prevent any LLM/TTS response
+        return ""
+
+
 async def entrypoint(ctx: JobContext):
-    """Called when a user joins a room — the agent connects and starts transcribing."""
+    """Called when a user joins a room."""
+    logger.info(f"Agent connecting to room: {ctx.room.name}")
 
-    try:
-        logger.info(f"Agent connecting to room: {ctx.room.name}")
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    participant = await ctx.wait_for_participant()
+    logger.info(f"Participant joined: {participant.identity}")
 
-        participant = await ctx.wait_for_participant()
-        logger.info(f"Participant joined: {participant.identity}")
+    # Create Deepgram STT
+    stt = deepgram.STT(
+        model="nova-3",
+        language="en",
+        interim_results=True,
+        punctuate=False,
+    )
 
-        # Wait for the participant to publish an audio track
-        audio_track = None
-        for pub in participant.track_publications.values():
-            if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
-                audio_track = pub.track
-                break
+    # Use AgentSession — this keeps the process alive and manages audio properly
+    session = AgentSession(
+        stt=stt,
+        # No LLM or TTS — we only want transcription
+    )
 
-        if not audio_track:
-            track_event = asyncio.Event()
-            received_track = None
+    # Listen for all speech events to send interim + final transcripts
+    @session.on("user_speech_committed")
+    def on_final(msg):
+        text = msg.content if hasattr(msg, 'content') else str(msg)
+        if text and text.strip():
+            logger.info(f"FINAL: {text}")
+            import asyncio
+            asyncio.ensure_future(_send_transcript(ctx, text.strip(), is_final=True))
 
-            def on_track_subscribed(track, publication, p):
-                nonlocal received_track
-                if p.identity == participant.identity and track.kind == rtc.TrackKind.KIND_AUDIO:
-                    received_track = track
-                    track_event.set()
+    @session.on("user_started_speaking")
+    def on_start():
+        logger.info("User started speaking")
 
-            ctx.room.on("track_subscribed", on_track_subscribed)
-            logger.info("Waiting for audio track...")
-            await asyncio.wait_for(track_event.wait(), timeout=30.0)
-            audio_track = received_track
+    @session.on("user_stopped_speaking")
+    def on_stop():
+        logger.info("User stopped speaking")
 
-        if not audio_track:
-            logger.error("No audio track received from participant")
-            return
-
-        logger.info(f"Got audio track: {audio_track.sid}")
-
-        # Create Deepgram STT
-        logger.info("Creating Deepgram STT...")
-        stt = deepgram.STT(
-            model="nova-3",
-            language="en",
-            interim_results=True,
-            punctuate=False,
-        )
-
-        logger.info("Creating STT stream...")
-        stt_stream = stt.stream()
-
-        logger.info("Creating audio stream...")
-        audio_stream = rtc.AudioStream(audio_track)
-
-        async def forward_audio():
-            logger.info("Audio forwarding started")
-            frame_count = 0
-            try:
-                async for frame_event in audio_stream:
-                    stt_stream.push_frame(frame_event.frame)
-                    frame_count += 1
-                    if frame_count == 1:
-                        logger.info("First audio frame received and forwarded to STT")
-                    if frame_count % 500 == 0:
-                        logger.info(f"Forwarded {frame_count} audio frames")
-            except Exception as e:
-                logger.error(f"Audio forwarding error: {e}")
-                logger.error(traceback.format_exc())
-            finally:
-                logger.info(f"Audio forwarding ended after {frame_count} frames")
-                await stt_stream.aclose()
-
-        async def process_transcriptions():
-            logger.info("Transcription processing started")
-            try:
-                async for event in stt_stream:
-                    logger.info(f"STT event type: {type(event).__name__}")
-                    if not isinstance(event, SpeechEvent):
-                        continue
-                    logger.info(f"Speech event: {event.type}")
-                    if event.type == SpeechEventType.INTERIM_TRANSCRIPT:
-                        text = event.alternatives[0].text if event.alternatives else ""
-                        if text:
-                            logger.info(f"Interim: {text}")
-                            await send_transcript(ctx, text, is_final=False)
-                    elif event.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        text = (event.alternatives[0].text if event.alternatives else "").strip()
-                        if text:
-                            logger.info(f"FINAL: {text}")
-                            await send_transcript(ctx, text, is_final=True)
-            except Exception as e:
-                logger.error(f"STT processing error: {e}")
-                logger.error(traceback.format_exc())
-
-        logger.info("Starting audio forwarding and transcription processing...")
-        await asyncio.gather(forward_audio(), process_transcriptions())
-
-    except Exception as e:
-        logger.error(f"ENTRYPOINT ERROR: {e}")
-        logger.error(traceback.format_exc())
+    logger.info("Starting AgentSession...")
+    await session.start(
+        room=ctx.room,
+        participant=participant,
+    )
+    logger.info("AgentSession started successfully")
 
 
-async def send_transcript(ctx: JobContext, text: str, is_final: bool):
+async def _send_transcript(ctx: JobContext, text: str, is_final: bool):
     """Send a transcription result to all participants via data channel."""
     if not text:
         return
@@ -137,11 +98,15 @@ async def send_transcript(ctx: JobContext, text: str, is_final: bool):
         "isFinal": is_final,
     }).encode("utf-8")
 
-    await ctx.room.local_participant.publish_data(
-        payload,
-        reliable=is_final,
-        topic="transcription",
-    )
+    try:
+        await ctx.room.local_participant.publish_data(
+            payload,
+            reliable=is_final,
+            topic="transcription",
+        )
+        logger.info(f"Sent transcript: {text}")
+    except Exception as e:
+        logger.error(f"Failed to send transcript: {e}")
 
 
 if __name__ == "__main__":
