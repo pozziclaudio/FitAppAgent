@@ -80,8 +80,11 @@ async def entrypoint(ctx: JobContext):
     def on_stop():
         logger.info("User stopped speaking")
 
+    agent = TranscriptionAgent()
+
     logger.info("Starting AgentSession...")
     await session.start(
+        agent=agent,
         room=ctx.room,
     )
     logger.info("AgentSession started successfully")
