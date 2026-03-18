@@ -83,7 +83,6 @@ async def entrypoint(ctx: JobContext):
     logger.info("Starting AgentSession...")
     await session.start(
         room=ctx.room,
-        participant=participant,
     )
     logger.info("AgentSession started successfully")
 
