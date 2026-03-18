@@ -1,11 +1,13 @@
 """
 FitTrack Voice Agent — LiveKit STT-only agent.
 
-Uses AgentSession with Deepgram STT. Transcriptions are forwarded
-to the client automatically via LiveKit's built-in transcription system.
+Uses AgentSession with Silero VAD + Deepgram STT.
+Sends transcriptions to the client via data channel.
 """
 
+import json
 import logging
+import asyncio
 
 from livekit.agents import (
     Agent,
@@ -15,14 +17,14 @@ from livekit.agents import (
     WorkerOptions,
     cli,
 )
-from livekit.plugins import deepgram
+from livekit.plugins import deepgram, silero
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fittrack-agent")
 
 
 class TranscriptionAgent(Agent):
-    """Minimal agent that just relays STT transcriptions — no LLM, no TTS."""
+    """Minimal agent — no LLM, no TTS, just transcription relay."""
 
     def __init__(self):
         super().__init__(instructions="You are a transcription relay. Do not speak.")
@@ -37,7 +39,8 @@ async def entrypoint(ctx: JobContext):
     participant = await ctx.wait_for_participant()
     logger.info(f"Participant joined: {participant.identity}")
 
-    # Create Deepgram STT
+    # Create VAD + STT
+    vad = silero.VAD.load()
     stt = deepgram.STT(
         model="nova-3",
         language="en",
@@ -45,20 +48,54 @@ async def entrypoint(ctx: JobContext):
         punctuate=False,
     )
 
-    # AgentSession manages the audio pipeline and keeps the process alive
+    # AgentSession with VAD to detect speech boundaries
     session = AgentSession(
         stt=stt,
-        # No LLM or TTS — transcriptions are forwarded via LiveKit's transcription API
+        vad=vad,
     )
 
     agent = TranscriptionAgent()
 
-    logger.info("Starting AgentSession...")
+    # Listen for user transcription events and forward via data channel
+    @session.on("user_speech_committed")
+    def on_committed(msg):
+        text = msg.content if hasattr(msg, 'content') else str(msg)
+        if text and text.strip():
+            logger.info(f"FINAL transcript: {text.strip()}")
+            asyncio.ensure_future(_send_transcript(ctx, text.strip(), True))
+
+    @session.on("user_started_speaking")
+    def on_start():
+        logger.info(">>> User started speaking")
+
+    @session.on("user_stopped_speaking")
+    def on_stop():
+        logger.info("<<< User stopped speaking")
+
+    logger.info("Starting AgentSession with VAD + STT...")
     await session.start(
         agent=agent,
         room=ctx.room,
     )
-    logger.info("AgentSession started successfully")
+    logger.info("AgentSession started successfully — listening for speech")
+
+
+async def _send_transcript(ctx: JobContext, text: str, is_final: bool):
+    """Send transcription to client via data channel."""
+    payload = json.dumps({
+        "transcript": text,
+        "isFinal": is_final,
+    }).encode("utf-8")
+
+    try:
+        await ctx.room.local_participant.publish_data(
+            payload,
+            reliable=is_final,
+            topic="transcription",
+        )
+        logger.info(f"Sent to client: {text}")
+    except Exception as e:
+        logger.error(f"Failed to send transcript: {e}")
 
 
 if __name__ == "__main__":

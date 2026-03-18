@@ -1,2 +1,3 @@
 livekit-agents~=1.4
 livekit-plugins-deepgram~=1.4
+livekit-plugins-silero~=1.4
