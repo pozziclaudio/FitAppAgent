@@ -10,6 +10,7 @@ No LLM, no TTS — just speech-to-text transcription relay.
 
 import json
 import logging
+import asyncio
 
 from livekit import rtc
 from livekit.agents import (
@@ -17,7 +18,6 @@ from livekit.agents import (
     JobContext,
     WorkerOptions,
     cli,
-    llm,
 )
 from livekit.agents.stt import SpeechEvent, SpeechEventType
 from livekit.plugins import deepgram
@@ -31,13 +31,42 @@ async def entrypoint(ctx: JobContext):
 
     logger.info(f"Agent connecting to room: {ctx.room.name}")
 
-    # Wait for a participant (the user) to connect
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     participant = await ctx.wait_for_participant()
     logger.info(f"Participant joined: {participant.identity}")
 
-    # Create Deepgram STT stream
+    # Wait for the participant to publish an audio track
+    audio_track = None
+    for pub in participant.track_publications.values():
+        if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+            audio_track = pub.track
+            break
+
+    if not audio_track:
+        # Wait for track to be published
+        track_event = asyncio.Event()
+        received_track = None
+
+        def on_track_subscribed(track, publication, p):
+            nonlocal received_track
+            if p.identity == participant.identity and track.kind == rtc.TrackKind.KIND_AUDIO:
+                received_track = track
+                track_event.set()
+
+        ctx.room.on("track_subscribed", on_track_subscribed)
+
+        logger.info("Waiting for audio track...")
+        await asyncio.wait_for(track_event.wait(), timeout=30.0)
+        audio_track = received_track
+
+    if not audio_track:
+        logger.error("No audio track received from participant")
+        return
+
+    logger.info(f"Got audio track: {audio_track.sid}")
+
+    # Create Deepgram STT
     stt = deepgram.STT(
         model="nova-3",
         language="en",
@@ -45,31 +74,39 @@ async def entrypoint(ctx: JobContext):
         punctuate=False,
     )
 
-    # Stream audio from the participant through STT
     stt_stream = stt.stream()
 
-    # Forward audio track to STT
-    async def process_audio():
-        async for event in rtc.AudioStream(
-            participant=participant,
-            track=None,  # auto-select first audio track
-        ):
-            stt_stream.push_frame(event.frame)
+    # Forward audio frames to STT
+    audio_stream = rtc.AudioStream(audio_track)
 
-    # Process STT results and send to client
-    async def process_stt():
-        async for event in stt_stream:
-            if isinstance(event, SpeechEvent):
+    async def forward_audio():
+        try:
+            async for frame_event in audio_stream:
+                stt_stream.push_frame(frame_event.frame)
+        except Exception as e:
+            logger.error(f"Audio forwarding error: {e}")
+        finally:
+            await stt_stream.aclose()
+
+    # Process STT events and send to client
+    async def process_transcriptions():
+        try:
+            async for event in stt_stream:
+                if not isinstance(event, SpeechEvent):
+                    continue
                 if event.type == SpeechEventType.INTERIM_TRANSCRIPT:
-                    await send_transcript(ctx, event.alternatives[0].text, is_final=False)
-                elif event.type == SpeechEventType.FINAL_TRANSCRIPT:
-                    text = event.alternatives[0].text.strip()
+                    text = event.alternatives[0].text if event.alternatives else ""
                     if text:
-                        logger.info(f"Final transcript: {text}")
+                        await send_transcript(ctx, text, is_final=False)
+                elif event.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    text = (event.alternatives[0].text if event.alternatives else "").strip()
+                    if text:
+                        logger.info(f"Transcript: {text}")
                         await send_transcript(ctx, text, is_final=True)
+        except Exception as e:
+            logger.error(f"STT processing error: {e}")
 
-    import asyncio
-    await asyncio.gather(process_audio(), process_stt())
+    await asyncio.gather(forward_audio(), process_transcriptions())
 
 
 async def send_transcript(ctx: JobContext, text: str, is_final: bool):
@@ -84,7 +121,7 @@ async def send_transcript(ctx: JobContext, text: str, is_final: bool):
 
     await ctx.room.local_participant.publish_data(
         payload,
-        reliable=is_final,  # Use reliable delivery for final transcripts
+        reliable=is_final,
         topic="transcription",
     )
 
